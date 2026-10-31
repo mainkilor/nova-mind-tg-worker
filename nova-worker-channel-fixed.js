@@ -83,7 +83,7 @@
 // ============================================================================
 // MODULE: config — constants & feature flags
 // ============================================================================
-var NOVA_VERSION = 'v26.21.101-channel-v3';
+var NOVA_VERSION = 'v26.21.108-full-models';
 
 /** parse userkey:uk_xxx|model  یا  userkey:uk_xxx/openai/gpt-oss-120b */
 function parseUserKeyModelRef(mid) {
@@ -203,7 +203,9 @@ var FEATURES = {
   preferFree: false,      // اول CF نرو — کلیدهای ثبت‌شده اولویت دارند
   freeFirst: true,        // بین کلیدها: groq/gemini قبل از پولی
   strictTruth: true,      // پاورقی مدل همیشه مسیر واقعی
-  selfTest: true          // /selftest و /api/selftest
+  selfTest: true,         // /selftest و /api/selftest
+  kbAutoHide: false,      // جمع خودکار با remove_keyboard خاموش (کیبورد کامل حذف می‌شد)
+  kbPersistent: false     // is_persistent خاموش — سوایپ جمع می‌کند ولی با آیکن کیبورد برمی‌گردد
 };
 
 function secretChatPath(env) {
@@ -961,7 +963,14 @@ async function collectKeys(env, onlyUserId) {
         Object.keys(PROVIDERS).forEach(function (id) {
           if (PROVIDERS[id].test(c.key)) known = id;
         });
-        if (known) {
+        if (c.base) {
+          // آدرس ذخیره‌شده کاربر/ادمین اولویت دارد
+          meta.base = c.base;
+          meta.name = c.name || (known && PROVIDERS[known].name) || pid;
+          if (!known && String(pid).indexOf('custom_') !== 0) {
+            pid = 'custom_' + hashStr(c.base).slice(0, 10);
+          }
+        } else if (known) {
           pid = known;
           meta.base = PROVIDERS[known].base;
           if (!meta.name) meta.name = PROVIDERS[known].name;
@@ -1555,6 +1564,31 @@ async function getWorkingModels(env, noCache) {
       });
     });
   } catch (e) {}
+
+  // مدل‌های ذخیره‌شده روی custom_keys (از ویزارد سایت+کلید)
+  try {
+    var cksM = env.BOT_KV ? ((await env.BOT_KV.get('custom_keys', 'json')) || []) : [];
+    cksM.forEach(function (c) {
+      if (!c || !c.key) return;
+      var pid = c.provider || ('custom_' + hashStr(c.base || c.site || c.key).slice(0, 10));
+      var nm = c.name || c.provider || pid;
+      var saved = Array.isArray(c.models) ? c.models.filter(Boolean) : [];
+      if (!result[pid]) {
+        result[pid] = { name: nm, models: saved.slice(0, 400), base: c.base || c.site || '' };
+      } else {
+        if (!result[pid].name || result[pid].name === pid) result[pid].name = nm;
+        saved.forEach(function (m) {
+          if (result[pid].models.indexOf(m) === -1) result[pid].models.push(m);
+        });
+      }
+      // اگر هنوز مدل ندارد، از fallback خالی نگذار — حداقل یک مدل پیش‌فرض
+      if (!result[pid].models.length) {
+        var defM = defaultModelForBase(c.base || c.site || '');
+        if (defM) result[pid].models = [defM];
+      }
+    });
+  } catch (eCk) {}
+
   if (Object.keys(result).length) await cacheSet(env, 'wm_v1', result, 300);
   return result;
 }
@@ -1791,10 +1825,8 @@ async function callExternalAllKeys(env, messages, opts) {
     var modelQueue = [model];
     if (/groq\.com/i.test(base)) {
       modelQueue = [model];
-      // فقط یک جایگزین سریع
       getFallbackModels('groq').slice(0, 2).forEach(function (m) { if (modelQueue.indexOf(m) < 0) modelQueue.push(m); });
     } else if (/openrouter\.ai/i.test(base)) {
-      // صف کوتاه — 403 پشت‌سرهم خیلی کند می‌کند
       var orSafe = ['openrouter/free', 'meta-llama/llama-3.3-70b-instruct:free'];
       modelQueue = [];
       if (model) modelQueue.push(model);
@@ -1802,9 +1834,37 @@ async function callExternalAllKeys(env, messages, opts) {
         if (modelQueue.indexOf(orSafe[os]) < 0) modelQueue.push(orSafe[os]);
       }
     }
+    // کلید شخصی / سایت سفارشی: صف مدل‌های همان کلید برای fallback
+    if (opts.onlyUserKeys || String(pid).indexOf('uk_') === 0 || String(pid).indexOf('custom_') === 0) {
+      var extraModels = [];
+      if (opts.userKeyModels && opts.userKeyModels.length) {
+        extraModels = opts.userKeyModels;
+      } else if (opts.userKeyId && env.BOT_KV && opts.userId) {
+        try {
+          var ukList = await getUserKeys(env, opts.userId);
+          for (var uxi = 0; uxi < ukList.length; uxi++) {
+            if (ukList[uxi] && ukList[uxi].id === opts.userKeyId && ukList[uxi].models) {
+              extraModels = ukList[uxi].models;
+              break;
+            }
+          }
+        } catch (eXm) {}
+      }
+      // از probe OKها اول
+      try {
+        var pmap = await cacheGet(env, 'mprobe_' + hashStr(String(opts.userId || '') + '|uk:' + String(opts.userKeyId || pid)));
+        if (pmap) {
+          var oks = Object.keys(pmap).filter(function (k) { return pmap[k] === 'ok'; });
+          if (oks.length) extraModels = oks.concat(extraModels.filter(function (m) { return oks.indexOf(m) === -1; }));
+        }
+      } catch (ePm) {}
+      extraModels.forEach(function (m) {
+        if (m && m !== 'auto' && modelQueue.indexOf(m) < 0) modelQueue.push(m);
+      });
+    }
     if (opts.noModelFallback) modelQueue = [model];
-    // حداکثر ۳ مدل در صف
-    if (modelQueue.length > 3) modelQueue = modelQueue.slice(0, 3);
+    // حداکثر ۶ مدل در صف (انتخابی + جایگزین‌ها)
+    if (modelQueue.length > 6) modelQueue = modelQueue.slice(0, 6);
     try {
       var r = null;
       var et = '';
@@ -12019,10 +12079,67 @@ if (text === '/inbox' || text === '📥 صندوق' || text === 'صندوق') {
 
   // ——— افزودن کلید شخصی (همه کاربران — با کلید خودشان به AI وصل می‌شوند) ———
   if (text.indexOf('/addkey') === 0) {
+    var restAdd = text.replace(/^\/addkey(@\w+)?\s*/i, '').trim();
     var parts = text.trim().split(/\s+/);
+
+    // بدون آرگومان → ویزارد: اول سایت
+    if (!restAdd) {
+      await admSetState(env, uid, { t: 'uaddkey_site' });
+      await tgReply(env, chatId,
+        '➕ ثبت کلید شخصی — مرحله ۱ از ۲\n\n' +
+        '🌐 آدرس سایت / API را بفرست:\n' +
+        '• https://openrouter.ai/api/v1\n' +
+        '• https://api.groq.com/openai/v1\n' +
+        '• https://api.example.com/v1\n\n' +
+        'یا یک‌جا:\n/addkey https://api.xxx.com/v1 sk-your-key\n\n' +
+        'سرویس‌های معروف:\n/addkey gemini AIza...\n/addkey groq gsk_...\n\n' +
+        '📖 /freekeys · لغو: /cancel'
+      );
+      return;
+    }
+
+    // URL + KEY یک‌جا
+    var shotBase = extractApiBaseFromText(restAdd);
+    var shotKey = extractApiKeyFromText(restAdd);
+    if (shotBase && shotBase.base && shotKey && shotKey.length >= 8) {
+      var modelsU = [];
+      try { modelsU = await discoverUserKeyModels(env, { key: shotKey, site: shotBase.base, base: shotBase.base, name: shotBase.provider }); } catch (eMu) {}
+      await saveUserKey(env, uid, {
+        provider: shotBase.provider || 'custom',
+        name: shotBase.provider || 'کلید من',
+        key: shotKey,
+        base: shotBase.base,
+        site: shotBase.base,
+        freeOnly: !!shotBase.freeOnly
+      }, name);
+      await admSetState(env, uid, null);
+      await tgReply(env, chatId,
+        '✅ کلید شخصی ذخیره شد\n' +
+        '🏷 ' + (shotBase.provider || 'Custom') + '\n' +
+        '🌐 ' + shotBase.base + '\n' +
+        (modelsU.length ? ('🤖 ' + modelsU.length + ' مدل پیدا شد:\n' + modelsU.slice(0, 12).map(function (m, i) { return (i + 1) + '. ' + m; }).join('\n')) : '⚠️ لیست مدل نیامد — در چت امتحان کن') +
+        '\n\n🎯 /models → انتخاب مدل\n🔑 /keys → کلیدهای من'
+      );
+      return;
+    }
+
+    // فقط URL → برو مرحله کلید
+    if (shotBase && shotBase.base && (!shotKey || shotKey.length < 8)) {
+      await admSetState(env, uid, { t: 'uaddkey_key', site: shotBase.base, base: shotBase.base, provider: shotBase.provider || '' });
+      await tgReply(env, chatId,
+        '➕ مرحله ۲ از ۲\n🌐 ' + shotBase.base + '\n\n🔑 حالا کلید API را بفرست.\nلغو: /cancel'
+      );
+      return;
+    }
+
     if (parts.length < 3) {
       await tgReply(env, chatId,
-        'فرمت:\n/addkey PROVIDER KEY\n\nمثال:\n/addkey gemini AIzaSy...\n/addkey groq gsk_...\n/addkey openrouter sk-or-...\n\n' +
+        'فرمت‌ها:\n' +
+        '• /addkey   ← ویزارد (سایت بعد کلید)\n' +
+        '• /addkey https://api.xxx.com/v1 sk-KEY\n' +
+        '• /addkey gemini AIzaSy...\n' +
+        '• /addkey groq gsk_...\n' +
+        '• /addkey openrouter sk-or-...\n\n' +
         'سایت‌های کلید رایگان: /freekeys'
       );
       return;
@@ -12032,6 +12149,25 @@ if (text === '/inbox' || text === '📥 صندوق' || text === 'صندوق') {
       .replace(/^[<>'"`]+/, '')
       .replace(/[<>'"`]+$/, '')
       .trim();
+    // اگر parts[1] آدرس است
+    if (/^https?:\/\//i.test(parts[1]) || /\.[a-z]{2,}/i.test(parts[1])) {
+      var nb = extractApiBaseFromText(parts[1]);
+      key = parts.slice(2).join(' ').trim();
+      if (nb && nb.base && key.length >= 8) {
+        var modelsU2 = [];
+        try { modelsU2 = await discoverUserKeyModels(env, { key: key, site: nb.base, base: nb.base, name: nb.provider }); } catch (e2) {}
+        await saveUserKey(env, uid, {
+          provider: nb.provider || 'custom', name: nb.provider || 'کلید من',
+          key: key, base: nb.base, site: nb.base, freeOnly: !!nb.freeOnly
+        }, name);
+        await tgReply(env, chatId,
+          '✅ کلید شخصی ذخیره شد\n🏷 ' + (nb.provider || 'Custom') + '\n🌐 ' + nb.base + '\n' +
+          (modelsU2.length ? ('🤖 مدل‌ها:\n' + modelsU2.slice(0, 12).map(function (m, i) { return (i + 1) + '. ' + m; }).join('\n')) : '') +
+          '\n\n🎯 /models'
+        );
+        return;
+      }
+    }
     if (key.length < 8) {
       await tgReply(env, chatId, '❌ کلید کوتاه یا نامعتبر است.');
       return;
@@ -12382,22 +12518,29 @@ if (text.indexOf('/setvip') === 0) {
     return;
   }
 
-  if (text === '/keys' || text === 'کلیدها' || text === '🔑 کلیدها' || text === '/test' || text === 'تست') {
-    // کاربران عادی / ویژه: فقط کلیدهای شخصی خودشان
-    if (role !== 'admin' && !(await isTgAdmin(env, chatId))) {
-      var my = await getUserKeys(env, uid);
-      if (!my.length) {
-        await tgReply(env, chatId, 'کلید شخصی ندارید.\n📖 /freekeys → سایت‌های رایگان\n➕ /addkey gemini AIzaSy...');
-        return;
-      }
-      var lines = ['🔑 کلیدهای شما («' + name + '»):\n'];
-      my.forEach(function (k, i) {
-        lines.push((i + 1) + '. ' + (k.name || k.provider) + ' → ' + maskKey(k.key));
-      });
-      lines.push('\nفقط روی حساب شما فعال‌اند.');
-      await tgReply(env, chatId, lines.join('\n'));
+  if (text === '/keys' || text === 'کلیدها' || text === '🔑 کلیدها') {
+    // ادمین → همان پنل مدیریت کلیدها (افزودن / حذف / لیست)
+    if (role === 'admin' || (await isTgAdmin(env, chatId))) {
+      await admShowKeys(env, chatId, null);
       return;
     }
+    // کاربران عادی / ویژه: فقط کلیدهای شخصی خودشان
+    var my = await getUserKeys(env, uid);
+    if (!my.length) {
+      await tgReply(env, chatId, 'کلید شخصی ندارید.\n📖 /freekeys → سایت‌های رایگان\n➕ /addkey\n(ویزارد: اول سایت، بعد کلید)');
+      return;
+    }
+    var lines = ['🔑 کلیدهای شما («' + name + '»):\n'];
+    my.forEach(function (k, i) {
+      lines.push((i + 1) + '. ' + (k.name || k.provider) +
+        (k.site || k.base ? ('\n   🌐 ' + (k.site || k.base)) : '') +
+        '\n   ' + maskKey(k.key || k.keyFull || ''));
+    });
+    lines.push('\nفقط روی حساب شما فعال‌اند.\n➕ /addkey · 🎯 /models');
+    await tgReply(env, chatId, lines.join('\n'));
+    return;
+  }
+  if (text === '/test' || text === 'تست' || text === '/keystatus' || text === 'وضعیت کلیدها') {
     await reportKeysStatus(env, chatId);
     return;
   }
@@ -12420,13 +12563,9 @@ if (text.indexOf('/setvip') === 0) {
         '❓ /help — راهنما\n' +
         '🗑️ /reset — پاک کردن تاریخچه');
     await tgReply(env, chatId, menuTxt + '\n\nاز دکمه‌های پایین هم استفاده کن.', {
-      reply_markup: {
-        keyboard: await buildTgKeyboard(env, isAdm),
-        resize_keyboard: true,
-        is_persistent: true,
-        input_field_placeholder: 'پیام بنویسید...'
-      }
+      reply_markup: tgKeyboardMarkup(await buildTgKeyboard(env, isAdm))
     });
+    queueHideKeyboard(env, chatId, 10);
     try { await setBotMenu(env); } catch (e) {}
     return;
   }
@@ -13494,7 +13633,7 @@ async function modelsForRole(env, uid, role) {
   var out = {};
   Object.keys(disc || {}).forEach(function (pid) {
     var list = ((disc[pid] && disc[pid].models) || []).filter(function (m) { return accessAllows(access, role, pid, m); });
-    if (list.length) out[pid] = { name: disc[pid].name || pid, models: list };
+    if (list.length) out[pid] = { name: disc[pid].name || pid, models: list, base: disc[pid].base || '' };
   });
   // مدل‌های دست‌ساز کاربر
   try {
@@ -13509,6 +13648,39 @@ async function modelsForRole(env, uid, role) {
       }
     });
   } catch (e) {}
+
+  // کلیدهای شخصی کاربر → گروه جدا با مدل‌های کشف‌شده (قابل انتخاب از منو)
+  try {
+    var ukeys = await getUserKeys(env, uid);
+    for (var ui = 0; ui < ukeys.length; ui++) {
+      var uk = ukeys[ui];
+      if (!uk || !uk.id) continue;
+      var ukPid = 'uk:' + uk.id;
+      var ukName = '🔑 ' + (uk.name || uk.provider || 'کلید من');
+      var ukModels = Array.isArray(uk.models) ? uk.models.slice() : [];
+      if (!ukModels.length) {
+        try {
+          ukModels = await discoverUserKeyModels(env, uk);
+        } catch (eDisc) {}
+      }
+      if (!ukModels.length) {
+        var defUk = defaultModelForBase(uk.base || uk.site || '');
+        if (defUk) ukModels = [defUk];
+        else ukModels = ['auto'];
+      }
+      // ذخیره مدل‌ها روی کلید برای دفعات بعد
+      if (ukModels.length && ukModels[0] !== 'auto' && (!uk.models || !uk.models.length)) {
+        try { await updateUserKey(env, uid, uk.id, { models: ukModels.slice(0, 80) }); } catch (eUp) {}
+      }
+      out[ukPid] = {
+        name: ukName,
+        models: ukModels.slice(0, 200),
+        base: uk.base || uk.site || '',
+        userKeyId: uk.id,
+        isUserKey: true
+      };
+    }
+  } catch (eUk) {}
   return out;
 }
 
@@ -13524,6 +13696,11 @@ async function showProviderMenu(env, chatId, uid, role, msgId) {
   var pids = Object.keys(avail).sort(function (a, b) {
     if (a === 'cf') return -1;
     if (b === 'cf') return 1;
+    // کلیدهای شخصی بالا
+    var aUk = String(a).indexOf('uk:') === 0;
+    var bUk = String(b).indexOf('uk:') === 0;
+    if (aUk && !bUk) return -1;
+    if (bUk && !aUk) return 1;
     return String(avail[a].name).localeCompare(String(avail[b].name));
   });
   var rows = [[{ text: '🤖 خودکار (هوشمند)', callback_data: 'model:auto' }]];
@@ -13556,13 +13733,16 @@ async function showProviderMenu(env, chatId, uid, role, msgId) {
     if (line.length === 2) { rows.push(line); line = []; }
   });
   if (line.length) rows.push(line);
-  var mine = await getUserKeys(env, uid);
-  if (mine.length) {
-    var toks = await cbRegister(env, chatId, mine.map(function (k) { return { m: 'userkey:' + k.id, p: k.provider || '' }; }));
-    mine.forEach(function (k, i) {
-      rows.push([{ text: ('🔑 ' + (k.name || k.provider || 'کلید من')).slice(0, 50), callback_data: 'model:' + toks[i] }]);
+  // کلیدهای شخصی قبلاً در modelsForRole به صورت uk:id آمده‌اند — دوبار نشان نده
+  // فقط اگر به هر دلیل در avail نبودند، دکمهٔ سریع بگذار
+  try {
+    var mine = await getUserKeys(env, uid);
+    mine.forEach(function (k) {
+      var ukPid = 'uk:' + k.id;
+      if (avail[ukPid]) return; // از قبل در لیست سرویس‌هاست
+      rows.push([{ text: ('🔑 ' + (k.name || k.provider || 'کلید من')).slice(0, 50), callback_data: 'mp:' + ukPid + ':0' }]);
     });
-  }
+  } catch (eMine) {}
   var acc = await getAccess(env, uid);
   var info = '';
   if (role === 'half' || role === 'vip') {
@@ -13580,23 +13760,245 @@ async function showProviderModels(env, chatId, uid, role, pid, page, msgId) {
   var info = avail[pid];
   if (!info) return showProviderMenu(env, chatId, uid, role, msgId);
   var emojiMap = await loadEmojiMap(env);
-  var PER = 8;
+  var PER = 10;
   var pages = Math.max(1, Math.ceil(info.models.length / PER));
   page = Math.min(Math.max(0, page | 0), pages - 1);
   var slice = info.models.slice(page * PER, page * PER + PER);
-  var toks = await cbRegister(env, chatId, slice.map(function (m) { return { m: m, p: pid }; }));
+  var isUk = String(pid).indexOf('uk:') === 0 || !!(info && info.isUserKey);
+  var ukId = info.userKeyId || (String(pid).indexOf('uk:') === 0 ? String(pid).slice(3) : '');
+
+  // وضعیت تست قبلی (اگر باشد)
+  var probeMap = {};
+  try {
+    var pk = 'mprobe_' + hashStr(String(uid) + '|' + String(pid));
+    probeMap = (await cacheGet(env, pk)) || {};
+  } catch (eP) {}
+
+  var toks = await cbRegister(env, chatId, slice.map(function (m) {
+    if (isUk && ukId) {
+      var mid = (m === 'auto') ? ('userkey:' + ukId) : ('userkey:' + ukId + '|' + m);
+      return { m: mid, p: 'userkey' };
+    }
+    return { m: m, p: pid };
+  }));
   var rows = slice.map(function (m, i) {
     var freeTag = isFreeModel(m) ? '🆓 ' : '';
-    return [{ text: (freeTag + emojiForModel(emojiMap, pid, m) + ' ' + shortModelName(m)).slice(0, 60), callback_data: 'model:' + toks[i] }];
+    var st = probeMap[m];
+    var mark = st === 'ok' ? '✅ ' : (st === 'fail' ? '❌ ' : '');
+    var label = (m === 'auto')
+      ? '🤖 خودکار (اگر یکی کار نکرد → بعدی)'
+      : (mark + freeTag + emojiForModel(emojiMap, pid, m) + ' ' + shortModelName(m));
+    return [{ text: label.slice(0, 64), callback_data: 'model:' + toks[i] }];
   });
   var nav = [];
   if (page > 0) nav.push({ text: '◀️', callback_data: 'mp:' + pid + ':' + (page - 1) });
   nav.push({ text: (page + 1) + '/' + pages, callback_data: 'mp:noop:0' });
   if (page < pages - 1) nav.push({ text: '▶️', callback_data: 'mp:' + pid + ':' + (page + 1) });
   rows.push(nav);
+  // دکمه تست اتصال مدل‌ها
+  var probeTok = 'mpprobe:' + String(pid).slice(0, 40);
+  rows.push([{ text: '🔍 تست اتصال مدل‌ها', callback_data: probeTok }]);
+  rows.push([{ text: '🔄 بارگذاری دوباره همه مدل‌ها', callback_data: 'mprefresh:' + String(pid).slice(0, 40) }]);
   rows.push([{ text: '🔙 همه‌ی سرویس‌ها', callback_data: 'mp:_:0' }]);
-  await admSend(env, chatId, msgId,
-    emojiForModel(emojiMap, pid, '') + ' ' + info.name + ' — ' + info.models.length + ' مدل', rows);
+  var okN = 0, failN = 0;
+  Object.keys(probeMap).forEach(function (k) {
+    if (probeMap[k] === 'ok') okN++;
+    else if (probeMap[k] === 'fail') failN++;
+  });
+  var head = (isUk ? '🔑 ' : (emojiForModel(emojiMap, pid, '') + ' ')) + info.name + ' — ' + info.models.length + ' مدل';
+  if (info.base) head += '\n🌐 ' + String(info.base).slice(0, 70);
+  if (okN || failN) head += '\n✅ وصل: ' + okN + ' · ❌ قطع: ' + failN + '  (فقط تست‌شده‌ها)';
+  head += '\n💡 اگر مدل انتخابی کار نکند، خودکار مدل بعدی همین کلید امتحان می‌شود.';
+  await admSend(env, chatId, msgId, head, rows);
+}
+
+/** بارگذاری دوباره لیست کامل مدل‌ها از API / کاتالوگ */
+async function refreshProviderModels(env, chatId, uid, role, pid, msgId) {
+  var avail = await modelsForRole(env, uid, role);
+  var info = avail[pid];
+  if (!info) {
+    await tgReply(env, chatId, 'سرویس پیدا نشد.');
+    return;
+  }
+  try {
+    if (msgId) {
+      await tg(env, 'editMessageText', {
+        chat_id: chatId, message_id: msgId,
+        text: '🔄 در حال خواندن همه مدل‌ها…'
+      });
+    }
+  } catch (e) {}
+
+  var base = info.base || '';
+  var keyVal = '';
+  var isUk = String(pid).indexOf('uk:') === 0 || !!(info && info.isUserKey);
+  var ukId = info.userKeyId || (String(pid).indexOf('uk:') === 0 ? String(pid).slice(3) : '');
+
+  if (isUk && ukId) {
+    try {
+      var uks = await getUserKeys(env, uid);
+      for (var i = 0; i < uks.length; i++) {
+        if (uks[i] && uks[i].id === ukId) {
+          keyVal = uks[i].key || uks[i].keyFull || '';
+          base = uks[i].base || uks[i].site || base;
+          break;
+        }
+      }
+    } catch (eU) {}
+  } else {
+    try {
+      var provs = await collectKeys(env);
+      if (provs[pid] && provs[pid].keys && provs[pid].keys.length) {
+        keyVal = typeof provs[pid].keys[0] === 'string' ? provs[pid].keys[0] : (provs[pid].keys[0].key || '');
+        base = provs[pid].base || base;
+      }
+      if (!keyVal && env.BOT_KV) {
+        var cks = (await env.BOT_KV.get('custom_keys', 'json')) || [];
+        for (var ci = 0; ci < cks.length; ci++) {
+          var c = cks[ci];
+          if (!c) continue;
+          if (c.provider === pid || String(c.name).toLowerCase() === String(info.name || '').toLowerCase()) {
+            keyVal = c.key;
+            base = c.base || c.site || base;
+            break;
+          }
+        }
+      }
+    } catch (eC) {}
+  }
+
+  var models = [];
+  try {
+    models = await discoverUserKeyModels(env, {
+      key: keyVal, site: base, base: base, name: info.name || pid, provider: info.name || pid
+    });
+  } catch (eD) {}
+
+  if (!models.length) models = commonOpenAICompatibleModels().slice();
+
+  // ذخیره روی کلید / custom
+  if (isUk && ukId) {
+    try { await updateUserKey(env, uid, ukId, { models: models.slice(0, 200) }); } catch (e1) {}
+  } else if (env.BOT_KV) {
+    try {
+      var cks2 = (await env.BOT_KV.get('custom_keys', 'json')) || [];
+      for (var j = 0; j < cks2.length; j++) {
+        if (cks2[j] && (cks2[j].provider === pid || (cks2[j].base && base && cks2[j].base.replace(/\/+$/, '') === base.replace(/\/+$/, '')))) {
+          cks2[j].models = models.slice(0, 200);
+        }
+      }
+      await env.BOT_KV.put('custom_keys', JSON.stringify(cks2));
+      await cacheDel(env, 'wm_v1');
+      try { await env.BOT_KV.delete('models_v27'); } catch (eM) {}
+    } catch (e2) {}
+  }
+
+  await showProviderModels(env, chatId, uid, role, pid, 0, msgId);
+  try {
+    await tg(env, 'sendMessage', {
+      chat_id: chatId,
+      text: '✅ ' + models.length + ' مدل برای «' + (info.name || pid) + '» بارگذاری شد.\nاز لیست انتخاب کن یا 🔍 تست اتصال بزن.'
+    });
+  } catch (e3) {}
+}
+
+/** تست اتصال مدل‌های یک سرویس/کلید و ذخیره نتیجه */
+async function runProviderModelProbe(env, chatId, uid, role, pid, msgId) {
+  var avail = await modelsForRole(env, uid, role);
+  var info = avail[pid];
+  if (!info) {
+    await tgReply(env, chatId, 'سرویس پیدا نشد.');
+    return;
+  }
+  await tg(env, 'sendChatAction', { chat_id: chatId, action: 'typing' });
+  try {
+    if (msgId) {
+      await tg(env, 'editMessageText', {
+        chat_id: chatId, message_id: msgId,
+        text: '🔍 در حال تست مدل‌ها با کلید…\n(چند ثانیه طول می‌کشد)'
+      });
+    }
+  } catch (eEd) {}
+
+  var base = info.base || '';
+  var keyVal = '';
+  var isUk = String(pid).indexOf('uk:') === 0 || !!(info && info.isUserKey);
+  var ukId = info.userKeyId || (String(pid).indexOf('uk:') === 0 ? String(pid).slice(3) : '');
+
+  if (isUk && ukId) {
+    try {
+      var uks = await getUserKeys(env, uid);
+      var hit = null;
+      for (var i = 0; i < uks.length; i++) if (uks[i] && uks[i].id === ukId) { hit = uks[i]; break; }
+      if (hit) {
+        keyVal = hit.key || hit.keyFull || '';
+        base = hit.base || hit.site || base;
+      }
+    } catch (eU) {}
+  } else {
+    // کلید سیستم / custom_keys
+    try {
+      var provs = await collectKeys(env);
+      if (provs[pid] && provs[pid].keys && provs[pid].keys.length) {
+        keyVal = typeof provs[pid].keys[0] === 'string' ? provs[pid].keys[0] : (provs[pid].keys[0].key || '');
+        base = provs[pid].base || base;
+      }
+      if (!keyVal && env.BOT_KV) {
+        var cks = (await env.BOT_KV.get('custom_keys', 'json')) || [];
+        for (var ci = 0; ci < cks.length; ci++) {
+          var c = cks[ci];
+          if (!c) continue;
+          if (c.provider === pid || ('custom_' + hashStr(c.base || '').slice(0, 10)) === pid) {
+            keyVal = c.key;
+            base = c.base || c.site || base;
+            break;
+          }
+        }
+      }
+    } catch (eC) {}
+  }
+
+  if (!base || !keyVal) {
+    await admSend(env, chatId, msgId,
+      '❌ آدرس یا کلید برای تست پیدا نشد.\nسرویس: ' + (info.name || pid),
+      [[{ text: '🔙 بازگشت', callback_data: 'mp:' + pid + ':0' }]]);
+    return;
+  }
+
+  // اول لیست را تازه کن
+  var models = (info.models || []).filter(function (m) { return m && m !== 'auto'; });
+  if (models.length < 3) {
+    try {
+      var fresh = await discoverUserKeyModels(env, { key: keyVal, site: base, base: base, name: info.name });
+      if (fresh && fresh.length) models = fresh;
+    } catch (eF) {}
+  }
+
+  var probed = await probeModelsBatch(env, base, keyVal, models, 15);
+  var pk = 'mprobe_' + hashStr(String(uid) + '|' + String(pid));
+  try { await cacheSet(env, pk, probed.status, 3600); } catch (eS) {}
+
+  // مدل‌های OK را اول لیست قرار بده و ذخیره کن
+  if (probed.ok.length && isUk && ukId) {
+    try {
+      var ordered = probed.ok.concat(models.filter(function (m) { return probed.ok.indexOf(m) === -1; }));
+      await updateUserKey(env, uid, ukId, { models: ordered.slice(0, 120) });
+    } catch (eOrd) {}
+  }
+
+  var report =
+    '🔍 نتیجه تست «' + (info.name || pid) + '»\n' +
+    '🌐 ' + String(base).slice(0, 70) + '\n\n' +
+    '✅ کار می‌کند (' + probed.ok.length + '):\n' +
+    (probed.ok.length ? probed.ok.slice(0, 20).map(function (m, i) { return (i + 1) + '. ' + m; }).join('\n') : '— هیچ‌کدام در این دور OK نشد') +
+    '\n\n❌ کار نکرد (' + probed.fail.length + '):\n' +
+    (probed.fail.length ? probed.fail.slice(0, 12).map(function (m) { return '• ' + m; }).join('\n') : '—') +
+    '\n\n💡 مدل‌های ✅ را از لیست انتخاب کن. اگر یکی قطع شد ربات خودکار بعدی را می‌زند.';
+
+  await admSend(env, chatId, msgId, report, [
+    [{ text: '📋 لیست مدل‌ها با وضعیت', callback_data: 'mp:' + pid + ':0' }],
+    [{ text: '🔙 همه‌ی سرویس‌ها', callback_data: 'mp:_:0' }]
+  ]);
 }
 
 async function showModelSearch(env, chatId, uid, role, q) {
@@ -13728,6 +14130,159 @@ var UK_KEYPFX = [
   [/^sk-proj-/i, 'https://api.openai.com/v1', 'OpenAI', false],
   [/^apx_live_/i, 'https://api.apmix.ai/v1', 'Apmix.ai', false]
 ];
+
+/** استخراج آدرس API از متن کاربر */
+function extractApiBaseFromText(t) {
+  t = String(t || '').trim();
+  if (!t) return null;
+  var urlMatch = t.match(/https?:\/\/[^\s<>"']+/i);
+  var candidate = urlMatch ? urlMatch[0] : '';
+  if (!candidate) {
+    // دامنه بدون پروتکل: api.xxx.com یا xxx.com/v1
+    var dm = t.match(/\b([a-z0-9][-a-z0-9.]*\.[a-z]{2,}(?:\/[^\s]*)?)/i);
+    if (dm && !/\.(png|jpg|jpeg|gif|webp|pdf|txt|js|css)$/i.test(dm[1])) candidate = dm[1];
+  }
+  if (!candidate) return null;
+  var norm = normalizeUserKeyBase(candidate, '', '');
+  if (!norm || !norm.base) {
+    try {
+      var u = new URL(/^https?:\/\//i.test(candidate) ? candidate : 'https://' + candidate);
+      var path = u.pathname.replace(/\/+$/, '');
+      if (!path || path === '/') path = '/v1';
+      path = path.replace(/\/(chat\/completions|models)$/i, '');
+      norm = { base: u.origin + path, provider: u.host, freeOnly: false };
+    } catch (e) { return null; }
+  }
+  return norm;
+}
+
+/** استخراج کلید API از متن (حذف URL و کلمات دستور) */
+function extractApiKeyFromText(t) {
+  t = String(t || '').trim()
+    .replace(/^[<>'"`]+/, '')
+    .replace(/[<>'"`]+$/, '')
+    .trim();
+  // اگر چند توکن است، کلیدی را بردار که شبیه کلید است
+  var parts = t.split(/[\s,;]+/).filter(Boolean);
+  var best = '';
+  for (var i = 0; i < parts.length; i++) {
+    var p = parts[i];
+    if (/^https?:\/\//i.test(p)) continue;
+    if (/^(addkey|provider|site|url|key|کلید|سایت|آدرس)$/i.test(p)) continue;
+    if (p.length >= 8 && /[a-zA-Z0-9_\-]/.test(p)) {
+      if (p.length > best.length) best = p;
+    }
+  }
+  if (best) return best;
+  // کل متن اگر URL نیست
+  if (t.length >= 8 && !/^https?:\/\//i.test(t) && t.indexOf(' ') === -1) return t;
+  return '';
+}
+
+/**
+ * ثبت کلید ادمین/سفارشی روی custom_keys + کشف مدل‌ها
+ * برمی‌گرداند: { ok, added, models, provider, base, error }
+ */
+async function finalizeCustomKeyAdd(env, keyVal, siteOrBase, nameHint) {
+  keyVal = extractApiKeyFromText(keyVal) || String(keyVal || '').trim();
+  if (!keyVal || keyVal.length < 8) return { ok: false, error: 'کلید کوتاه یا نامعتبر است.' };
+
+  var norm = normalizeUserKeyBase(siteOrBase || '', keyVal, nameHint || '');
+  var base = norm.base || '';
+  var providerName = norm.provider || nameHint || 'Custom';
+
+  // اگر base خالی و پیشوند شناخته‌شده → OK
+  if (!base) {
+    var pid = null;
+    Object.keys(PROVIDERS).forEach(function (id) {
+      if (!pid && PROVIDERS[id].test(keyVal)) pid = id;
+    });
+    if (pid && PROVIDERS[pid]) {
+      base = PROVIDERS[pid].base;
+      providerName = PROVIDERS[pid].name || pid;
+    }
+  }
+  if (!base) {
+    return { ok: false, error: 'آدرس سایت/API مشخص نیست. اول آدرس را بفرست (مثلاً https://api.example.com/v1)' };
+  }
+
+  // تشخیص provider id
+  var pid = 'custom_' + String(providerName || 'api').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 24);
+  Object.keys(PROVIDERS).forEach(function (id) {
+    if (PROVIDERS[id].test(keyVal)) pid = id;
+  });
+  // اگر base سفارشی است و با provider شناخته‌شده فرق دارد، custom نگه دار
+  if (pid !== 'custom_' + String(providerName).toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 24)) {
+    var knownBase = PROVIDERS[pid] && PROVIDERS[pid].base;
+    if (knownBase && base && String(knownBase).replace(/\/+$/, '') !== String(base).replace(/\/+$/, '')) {
+      // کلید پیشوند شناخته دارد ولی سایت فرق دارد → custom با base کاربر
+      pid = 'custom_' + hashStr(base).slice(0, 10);
+      providerName = (nameHint || providerName || 'Custom API');
+    }
+  }
+
+  var models = [];
+  try {
+    models = await discoverUserKeyModels(env, { key: keyVal, site: base, base: base, name: providerName, provider: providerName });
+  } catch (eM) {}
+
+  var cks = (await env.BOT_KV.get('custom_keys', 'json')) || [];
+  // تکراری؟
+  if (cks.some(function (c) { return c && c.key === keyVal; })) {
+    return { ok: false, error: 'این کلید قبلاً ثبت شده است.', models: models, provider: providerName, base: base };
+  }
+
+  var rec = {
+    provider: pid,
+    name: providerName,
+    key: keyVal,
+    base: base,
+    site: base,
+    models: (models || []).slice(0, 200),
+    ts: Date.now()
+  };
+  cks.push(rec);
+  await env.BOT_KV.put('custom_keys', JSON.stringify(cks.slice(-40)));
+  try {
+    await env.BOT_KV.delete('models_v27');
+    await env.BOT_KV.delete('cache:wm_v1');
+    await cacheDel(env, 'wm_v1');
+  } catch (eC) {}
+
+  return {
+    ok: true,
+    added: true,
+    provider: providerName,
+    pid: pid,
+    base: base,
+    models: models || [],
+    keyPreview: (typeof maskKey === 'function') ? maskKey(keyVal) : (keyVal.slice(0, 4) + '…')
+  };
+}
+
+function formatKeyAddSuccess(res) {
+  var lines = [];
+  lines.push('✅ کلید ثبت شد');
+  lines.push('🏷 سرویس: ' + (res.provider || '?'));
+  lines.push('🌐 آدرس: ' + (res.base || '?'));
+  lines.push('🔑 کلید: ' + (res.keyPreview || '…'));
+  if (res.models && res.models.length) {
+    lines.push('');
+    lines.push('🤖 مدل‌های پیدا شده (' + res.models.length + '):');
+    res.models.slice(0, 15).forEach(function (m, i) {
+      lines.push((i + 1) + '. ' + m);
+    });
+    if (res.models.length > 15) lines.push('… و ' + (res.models.length - 15) + ' مدل دیگر');
+  } else {
+    lines.push('');
+    lines.push('⚠️ لیست مدل از /models نیامد (ممکن است endpoint محدود باشد).');
+    lines.push('کلید ذخیره شد — در چت با مدل خودکار امتحان کن.');
+  }
+  lines.push('');
+  lines.push('🎯 /models برای انتخاب مدل');
+  return lines.join('\n');
+}
+
 function normalizeUserKeyBase(siteOrUrl, keyVal, nameHint) {
   var s = String(siteOrUrl || '').trim();
   var key = String(keyVal || '').trim();
@@ -13798,84 +14353,233 @@ function isProbablyFreeModelId(id, pricing) {
 }
 
 
+/** کاتالوگ رایج مدل‌های چت برای پروکسی‌های OpenAI-compatible که /models ناقص دارند */
+function commonOpenAICompatibleModels() {
+  return [
+    // Google Gemini
+    'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-2.0-flash-lite',
+    'gemini-flash-latest', 'gemini-pro-latest', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.5-flash-8b',
+    // OpenAI
+    'gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4-turbo', 'gpt-3.5-turbo',
+    'o1', 'o1-mini', 'o1-preview', 'o3-mini', 'chatgpt-4o-latest',
+    // Anthropic
+    'claude-sonnet-4-6', 'claude-opus-4', 'claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest',
+    'claude-3-opus-latest', 'claude-3-haiku-20240307', 'claude-3-5-sonnet-20241022',
+    // DeepSeek / Qwen / Mistral / Llama
+    'deepseek-chat', 'deepseek-reasoner', 'deepseek-coder',
+    'qwen-max', 'qwen-plus', 'qwen-turbo', 'qwen2.5-72b-instruct', 'qwen2.5-32b-instruct',
+    'mistral-large-latest', 'mistral-small-latest', 'mistral-medium-latest', 'codestral-latest',
+    'llama-3.3-70b-instruct', 'llama-3.1-70b-instruct', 'llama-3.1-8b-instruct', 'llama-3.2-3b-instruct',
+    'meta-llama/llama-3.3-70b-instruct', 'meta-llama/llama-3.1-8b-instruct',
+    // Grok / others
+    'grok-3', 'grok-3-mini', 'grok-2', 'grok-2-latest',
+    'command-r-plus', 'command-r', 'sonar', 'sonar-pro'
+  ];
+}
+
 async function discoverUserKeyModels(env, keyRec) {
   if (!keyRec || !(keyRec.key || keyRec.keyFull)) return [];
   var keyVal = String(keyRec.key || keyRec.keyFull || '').trim();
   var norm = normalizeUserKeyBase(keyRec.site || keyRec.base || keyRec.url, keyVal, keyRec.name || keyRec.provider);
-  var base = norm.base;
+  var base = String(norm.base || keyRec.base || keyRec.site || '').replace(/\/+$/, '');
   var freeOnly = !!norm.freeOnly || !!keyRec.freeOnly;
   var isGroq = /groq\.com/i.test(base) || /^gsk_/i.test(keyVal) || /groq/i.test(String(keyRec.name || keyRec.provider || ''));
   var isOpenRouter = /openrouter/i.test(base) || /^sk-or-/i.test(keyVal);
+  var hostHint = String(keyRec.name || keyRec.provider || base || '');
 
   function isChatModelId(id) {
     var s = String(id || '').toLowerCase();
     if (!s) return false;
-    // غیر چت
-    if (/whisper|tts|speech|audio|embed|embedding|moderation|guard|prompt-guard|rerank|vision-only|dall-e|stable-diffusion|flux|image|video|transcri/i.test(s)) return false;
-    // چت / instruct
-    if (/instruct|chat|llama|gemma|mistral|qwen|gpt|claude|gemini|deepseek|mixtral|phi|command|nova|sonar|versatile|instant|oss|70b|8b|9b|12b|3\.[0-9]|4o|4\.|sonnet|haiku/i.test(s)) return true;
-    // اگر نوع مشخص نیست ولی شبیه مدل متنی است
+    if (/whisper|tts|speech|audio|embed|embedding|moderation|guard|prompt-guard|rerank|vision-only|dall-e|stable-diffusion|flux|image|video|transcri|realtime|search-preview/i.test(s)) return false;
+    if (/instruct|chat|llama|gemma|mistral|qwen|gpt|claude|gemini|deepseek|mixtral|phi|command|nova|sonar|versatile|instant|oss|70b|8b|9b|12b|3\.[0-9]|4o|4\.|sonnet|haiku|opus|grok|o1|o3|codestral|command-r/i.test(s)) return true;
     if (!/[^a-z0-9.\/\-_:]/i.test(s) && s.length > 3) return true;
     return false;
   }
 
-  var url = String(base).replace(/\/+$/, '') + '/models';
-  var found = [];
-  var freeFound = [];
-  try {
-    var r = await fetchT(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': 'Bearer ' + keyVal,
-        'x-api-key': keyVal,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'HTTP-Referer': 'https://nova.ai',
-        'X-Title': 'Nova AI'
-      }
-    }, 8000);
-    if (r && r.ok) {
-      var j = await r.json();
-      var arr = (j && j.data) ? j.data : (Array.isArray(j) ? j : []);
-      for (var i = 0; i < arr.length && found.length < 80; i++) {
-        var it = arr[i];
-        var id = (typeof it === 'string') ? it : (it && (it.id || it.name));
-        if (!id) continue;
-        var idS = String(id);
-        if (!isChatModelId(idS)) continue;
-        var kind = (it && (it.kind || it.type || (it.object))) ? String(it.kind || it.type || '').toLowerCase() : '';
-        if (kind && /embed|audio|image|video|moderation/.test(kind)) continue;
-        found.push(idS);
-        if (isProbablyFreeModelId(idS, it && it.pricing)) freeFound.push(idS);
+  function pushId(arr, id) {
+    if (!id) return;
+    var idS = String(id).replace(/^models\//, '').trim();
+    if (!idS || !isChatModelId(idS)) return;
+    if (arr.indexOf(idS) === -1) arr.push(idS);
+  }
+
+  function parseModelsPayload(j) {
+    var out = [];
+    if (!j) return out;
+    var arr = [];
+    if (Array.isArray(j)) arr = j;
+    else if (Array.isArray(j.data)) arr = j.data;
+    else if (Array.isArray(j.models)) arr = j.models;
+    else if (Array.isArray(j.result)) arr = j.result;
+    else if (j.data && Array.isArray(j.data.data)) arr = j.data.data;
+    else if (j.model_list && Array.isArray(j.model_list)) arr = j.model_list;
+    else if (typeof j === 'object') {
+      // بعضی APIها { "gemini-2.5-flash": {...}, ... }
+      Object.keys(j).forEach(function (k) {
+        if (k === 'object' || k === 'data' || k === 'error') return;
+        if (isChatModelId(k)) pushId(out, k);
+      });
+    }
+    for (var i = 0; i < arr.length; i++) {
+      var it = arr[i];
+      if (typeof it === 'string') pushId(out, it);
+      else if (it && typeof it === 'object') {
+        pushId(out, it.id || it.name || it.model || it.model_id || it.modelId);
       }
     }
-  } catch (e) {}
+    return out;
+  }
+
+  var headers = {
+    'Authorization': 'Bearer ' + keyVal,
+    'x-api-key': keyVal,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'HTTP-Referer': 'https://nova.ai',
+    'X-Title': 'Nova AI',
+    'User-Agent': 'Mozilla/5.0 NovaAI/26'
+  };
+
+  // چند مسیر رایج برای لیست مدل
+  var tryUrls = [];
+  if (base) {
+    tryUrls.push(base + '/models');
+    tryUrls.push(base + '/v1/models');
+    // اگر base خودش .../v1 است، دوباره /models کافی است
+    if (!/\/v1$/i.test(base)) tryUrls.push(base.replace(/\/v1$/i, '') + '/v1/models');
+    tryUrls.push(base + '/model/list');
+    tryUrls.push(base + '/api/models');
+  }
+  // یکتا
+  var seenU = {};
+  tryUrls = tryUrls.filter(function (u) {
+    if (seenU[u]) return false;
+    seenU[u] = true;
+    return true;
+  });
+
+  var found = [];
+  var freeFound = [];
+  for (var ui = 0; ui < tryUrls.length; ui++) {
+    try {
+      var r = await fetchT(tryUrls[ui], { method: 'GET', headers: headers }, 10000);
+      if (!r || !r.ok) continue;
+      var t = await r.text();
+      var j = null;
+      try { j = JSON.parse(t); } catch (eJ) { continue; }
+      var parsed = parseModelsPayload(j);
+      for (var pi = 0; pi < parsed.length; pi++) {
+        pushId(found, parsed[pi]);
+        if (isProbablyFreeModelId(parsed[pi], null)) pushId(freeFound, parsed[pi]);
+      }
+      // اگر لیست خوبی آمد، لازم نیست همه URLها را بزنیم
+      if (found.length >= 8) break;
+    } catch (eTry) {}
+  }
+
+  // اگر خیلی کم بود، کاتالوگ رایج را هم اضافه کن (سایت‌هایی مثل opencode که /models ناقص‌اند)
+  var isCustomProxy = base && !/openai\.com|googleapis|groq\.com|openrouter\.ai|anthropic\.com|deepseek\.com|mistral\.ai|x\.ai|cerebras|nvidia\.com/i.test(base);
+  if (found.length < 15 && isCustomProxy && !freeOnly) {
+    commonOpenAICompatibleModels().forEach(function (m) { pushId(found, m); });
+  }
+  // اگر هنوز خالی — حداقل کاتالوگ + default
+  if (!found.length) {
+    if (isCustomProxy) commonOpenAICompatibleModels().forEach(function (m) { pushId(found, m); });
+    var defB = defaultModelForBase(base);
+    if (defB) pushId(found, defB);
+    // gemini-style defaults for many Iranian/proxy sites
+    if (/opencode|bazaarlink|genspark|manus|llm-stats|any.?model/i.test(hostHint + base)) {
+      ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-flash-latest',
+        'gpt-4o-mini', 'gpt-4o', 'claude-3-5-haiku-latest', 'deepseek-chat'].forEach(function (m) { pushId(found, m); });
+    }
+  }
 
   if (isGroq) {
     var gl = found.filter(function (id) { return isChatModelId(id) && !/whisper|guard|tts|transcri/i.test(id); });
-    return (gl.length ? gl : getFallbackModels('groq')).slice(0, 25);
+    return (gl.length ? gl : getFallbackModels('groq')).slice(0, 100);
   }
 
-  if (freeOnly && freeFound.length) return freeFound.filter(isChatModelId).slice(0, 40);
+  if (freeOnly && freeFound.length) return freeFound.filter(isChatModelId).slice(0, 200);
   if (isOpenRouter || freeOnly) {
-    var orFree = [
+    if (freeFound.length) {
+      return freeFound.concat(found.filter(function (m) { return freeFound.indexOf(m) === -1; })).filter(isChatModelId).slice(0, 250);
+    }
+    if (found.length) return found.filter(isChatModelId).slice(0, 250);
+    return [
       'openrouter/free',
       'meta-llama/llama-3.3-70b-instruct:free',
       'meta-llama/llama-3.2-3b-instruct:free',
       'google/gemma-2-9b-it:free',
-      'mistralai/mistral-7b-instruct:free',
-      'microsoft/phi-3-mini-128k-instruct:free',
-      'qwen/qwen-2-7b-instruct:free'
+      'mistralai/mistral-7b-instruct:free'
     ];
-    if (freeFound.length) return freeFound.filter(isChatModelId).slice(0, 40);
-    return orFree;
   }
-  if (freeFound.length >= 3) return freeFound.filter(isChatModelId).slice(0, 40);
-  if (found.length) return found.filter(isChatModelId).slice(0, 30);
-  if (/anymodel\.org/i.test(base)) {
-    return ['gpt-5.6-luna', 'claude-haiku-4-5', 'gemini-2.5-flash', 'deepseek-chat'];
-  }
+  if (found.length) return found.filter(isChatModelId).slice(0, 300);
   return [];
+}
+
+/** تست واقعی یک مدل با یک درخواست کوتاه — مشخص می‌کند به کلید وصل است یا نه */
+async function probeModelWithKey(base, keyVal, modelId) {
+  base = String(base || '').replace(/\/+$/, '');
+  keyVal = String(keyVal || '').trim();
+  modelId = String(modelId || '').trim();
+  if (!base || !keyVal || !modelId || modelId === 'auto') return { ok: false, skip: true };
+  try {
+    var r = await fetchT(base + '/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + keyVal,
+        'x-api-key': keyVal,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://nova.ai',
+        'X-Title': 'Nova AI'
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 4,
+        temperature: 0
+      })
+    }, 9000);
+    if (!r) return { ok: false, error: 'no response' };
+    var t = '';
+    try { t = await r.text(); } catch (eT) {}
+    if (r.ok) {
+      // پاسخ معتبر JSON؟
+      try {
+        var j = JSON.parse(t);
+        if (j && (j.choices || j.output || j.content || j.text)) return { ok: true, model: modelId };
+      } catch (eJ) {}
+      if (t && t.length > 2 && !/<html/i.test(t)) return { ok: true, model: modelId };
+      return { ok: false, status: r.status, error: 'empty body' };
+    }
+    return { ok: false, status: r.status, error: String(t).slice(0, 140) };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+}
+
+/**
+ * چند مدل را موازی تست می‌کند (حداکثر maxProbe تا از timeout Worker رد نشود)
+ * خروجی: { ok: [id...], fail: [id...], status: { id: 'ok'|'fail' } }
+ */
+async function probeModelsBatch(env, base, keyVal, models, maxProbe) {
+  maxProbe = maxProbe || 12;
+  models = (models || []).filter(function (m) { return m && m !== 'auto'; }).slice(0, maxProbe);
+  var status = {};
+  var ok = [];
+  var fail = [];
+  // موازی با دسته‌های ۳تایی
+  for (var i = 0; i < models.length; i += 3) {
+    var batch = models.slice(i, i + 3);
+    var results = await Promise.all(batch.map(function (m) {
+      return probeModelWithKey(base, keyVal, m).then(function (r) { return { m: m, r: r }; });
+    }));
+    results.forEach(function (x) {
+      if (x.r && x.r.ok) { status[x.m] = 'ok'; ok.push(x.m); }
+      else { status[x.m] = 'fail'; fail.push(x.m); }
+    });
+  }
+  return { ok: ok, fail: fail, status: status };
 }
 
 
@@ -13909,6 +14613,7 @@ async function saveUserKey(env, uid, keyData, userName) {
     keyData.uid = uid;
     keyData.userName = userName || '';
     keyData.addedAt = Date.now();
+    if (keyData.models && !Array.isArray(keyData.models)) keyData.models = [];
     list.push(keyData);
     await env.BOT_KV.put('user_keys_' + uid, JSON.stringify(list.slice(-10)));
     var all = (await env.BOT_KV.get('all_user_keys', 'json')) || [];
@@ -13941,6 +14646,7 @@ async function updateUserKey(env, uid, keyId, patch, userName) {
         }
         if (patch.key && String(patch.key).length >= 6) list[i].key = patch.key;
         if (patch.freeOnly != null) list[i].freeOnly = !!patch.freeOnly;
+        if (patch.models && Array.isArray(patch.models)) list[i].models = patch.models.slice(0, 100);
         list[i].updatedAt = Date.now();
         found = true;
         break;
@@ -14274,6 +14980,75 @@ function formatCryptoReportFull(payload) {
   return lines.join('\n');
 }
 
+
+/** Reply keyboard markup — غیرثابت تا کاربر بتواند جمعش کند */
+function tgKeyboardMarkup(rows, opts) {
+  opts = opts || {};
+  var persistent = FEATURES.kbPersistent === true;
+  if (opts.persistent === true) persistent = true;
+  if (opts.persistent === false) persistent = false;
+  return {
+    keyboard: rows,
+    resize_keyboard: true,
+    is_persistent: persistent,
+    one_time_keyboard: !!opts.oneTime,
+    input_field_placeholder: opts.placeholder || 'پیام بنویسید...'
+  };
+}
+
+/** صف جمع‌کردن کیبورد بعد از چند ثانیه (با waitUntil در webhook) */
+function queueHideKeyboard(env, chatId, sec) {
+  if (!FEATURES.kbAutoHide) return;
+  if (!env) return;
+  chatId = String(chatId || '');
+  if (!chatId) return;
+  if (!env.__kbHideJobs) env.__kbHideJobs = [];
+  // جلوگیری از صف تکراری برای یک چت
+  if (env.__kbHideJobs.indexOf(chatId) === -1) env.__kbHideJobs.push(chatId);
+  env.__kbHideSec = sec || 10;
+}
+
+async function flushHideKeyboardJobs(env, ctx) {
+  if (!FEATURES.kbAutoHide || !env || !env.__kbHideJobs || !env.__kbHideJobs.length) return;
+  var jobs = env.__kbHideJobs.slice();
+  var sec = env.__kbHideSec || 10;
+  env.__kbHideJobs = [];
+  var p = (async function () {
+    try {
+      await new Promise(function (r) { setTimeout(r, Math.max(3, sec) * 1000); });
+      for (var i = 0; i < jobs.length; i++) {
+        var chatId = jobs[i];
+        try {
+          var r = await tgSendSafe(env, 'sendMessage', {
+            chat_id: chatId,
+            text: '⬇️ کیبورد جمع شد — باز کردن: /menu',
+            reply_markup: { remove_keyboard: true },
+            disable_notification: true
+          }, 1);
+          if (r && r.ok && r.result && r.result.message_id) {
+            var mid = r.result.message_id;
+            await new Promise(function (r2) { setTimeout(r2, 2800); });
+            try { await tg(env, 'deleteMessage', { chat_id: chatId, message_id: mid }); } catch (eDel) {}
+          }
+        } catch (eOne) {}
+      }
+    } catch (eAll) {}
+  })();
+  if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(p);
+  else try { await p; } catch (e) {}
+}
+
+async function hideKeyboardNow(env, chatId, notice) {
+  try {
+    await tgSendSafe(env, 'sendMessage', {
+      chat_id: chatId,
+      text: notice || '⬇️ کیبورد بسته شد.\nبرای باز کردن دوباره بفرست: /menu',
+      reply_markup: { remove_keyboard: true },
+      disable_notification: true
+    }, 1);
+  } catch (e) {}
+}
+
 function defaultTgKeyboardConfig() {
   return {
     rows: [
@@ -14283,7 +15058,7 @@ function defaultTgKeyboardConfig() {
       [{ text: '🎨 تولید عکس', action: 'یک عکس زیبا بساز' }, { text: '🎬 استوری‌بورد', action: 'استوری بورد بساز' }, { text: '🎵 ساخت آهنگ', action: 'یک آهنگ بساز' }],
       [{ text: '🎯 مدل‌ها', action: '/models' }, { text: '🔑 کلید رایگان', action: '/freekeys' }, { text: '✉️ پشتیبانی', action: '__support__' }],
       [{ text: '🔍 مهندسی معکوس', action: '/rea' }, { text: '📊 وضعیت', action: '/status' }, { text: '❓ راهنما', action: '/help' }],
-      [{ text: '📋 منو', action: '/menu' }, { text: '🗑️ پاک کردن', action: '/reset' }]
+      [{ text: '📋 منو', action: '/menu' }, { text: '🗑️ پاک کردن', action: '/reset' }, { text: '⬇️ بستن کیبورد', action: '__hidekb__' }]
     ],
     adminRows: [
       [{ text: '⚙️ مدیریت', action: '/admin' }, { text: '🔑 کلیدها', action: '/keys' }, { text: '👥 کاربران', action: '/users' }],
@@ -14320,6 +15095,7 @@ function normalizeKeyboardAction(action, buttonText) {
     keys: '/keys', users: '/users', stats: '/stats', inbox: '/inbox',
     freekeys: '/freekeys', mode: '/mode', memory: '/memory', usage: '/usage',
     userkeys: '/userkeys', support: '__support__', news: '__news__',
+    hidekb: '__hidekb__', hide: '__hidekb__',
     rea: '/rea', reverse: '/rea'
   };
   if (cmdMap[bare]) return cmdMap[bare];
@@ -14751,23 +15527,34 @@ async function admShowDocs(env, chatId, msgId) {
 }
 
 async function admShowKeys(env, chatId, msgId) {
-  var ks = await checkKeysStatus(env);
-  var lines = ['🔑 وضعیت کلیدها\n'];
-  ks.forEach(function (x) {
-    lines.push((x.connected ? '✅ ' : '❌ ') + x.name + ' — ' + (x.detail || '') + (x.keys ? ' (' + x.keys + ')' : ''));
-  });
   var ck = env.BOT_KV ? ((await env.BOT_KV.get('custom_keys', 'json')) || []) : [];
+  var lines = ['🔑 مدیریت کلیدها\n'];
   var kb = [];
+
   if (ck.length) {
-    lines.push('\n🗂 کلیدهای ثبت‌شده از پنل:');
-    ck.slice(0, 8).forEach(function (k, i) {
-      var nm = k.name || (PROVIDERS[k.provider] && PROVIDERS[k.provider].name) || k.provider;
+    lines.push('🗂 کلیدهای ثبت‌شده از پنل (' + ck.length + '):\n');
+    ck.slice(0, 20).forEach(function (k, i) {
+      var nm = k.name || (PROVIDERS[k.provider] && PROVIDERS[k.provider].name) || k.provider || 'Custom';
+      var site = k.base || k.site || '';
       lines.push((i + 1) + '. ' + nm + ' — ' + maskKey(k.key));
-      kb.push([{ text: '🗑 حذف #' + (i + 1) + ' ' + String(nm).slice(0, 20), callback_data: 'adm:kdel:' + i }]);
+      if (site) lines.push('   🌐 ' + String(site).slice(0, 60));
+      if (k.models && k.models.length) lines.push('   🤖 ' + k.models.length + ' مدل');
+      kb.push([{ text: '🗑 حذف #' + (i + 1) + ' ' + String(nm).slice(0, 22), callback_data: 'adm:kdel:' + i }]);
     });
+  } else {
+    lines.push('هنوز کلیدی از پنل ثبت نشده.\nبا «➕ افزودن کلید» اول آدرس سایت بعد کلید را بفرست.\n');
   }
-  kb.push([{ text: '➕ افزودن کلید', callback_data: 'adm:addkey' }, { text: '🔄 بررسی دوباره', callback_data: 'adm:keys' }]);
-  kb.push([{ text: '🔙 منو', callback_data: 'adm:menu' }]);
+
+  // خلاصه کوتاه اتصال (بدون جایگزین کردن پنل مدیریت)
+  try {
+    var ks = await checkKeysStatus(env);
+    var okN = 0, badN = 0;
+    ks.forEach(function (x) { if (x.connected) okN++; else badN++; });
+    lines.push('\n📡 اتصال: ✅ ' + okN + ' · ❌ ' + badN + '  (جزئیات: /keystatus)');
+  } catch (eKs) {}
+
+  kb.push([{ text: '➕ افزودن کلید', callback_data: 'adm:addkey' }, { text: '🔄 تازه‌سازی', callback_data: 'adm:keys' }]);
+  kb.push([{ text: '📊 وضعیت اتصال', callback_data: 'adm:keystatus' }, { text: '🔙 منو', callback_data: 'adm:menu' }]);
   await admSend(env, chatId, msgId, lines.join('\n'), kb);
 }
 
@@ -14832,6 +15619,17 @@ async function tgAdminCallback(env, ctx, cq) {
   }
   if (act === 'docs') { await admSetState(env, adminUid, null); return admShowDocs(env, chatId, msgId); }
   if (act === 'keys') return admShowKeys(env, chatId, msgId);
+  if (act === 'keystatus') {
+    var ks2 = await checkKeysStatus(env);
+    var lines2 = ['🔑 وضعیت اتصال کلیدها:\n'];
+    ks2.forEach(function (x) {
+      lines2.push((x.connected ? '✅ ' : '❌ ') + x.name + ' — ' + (x.detail || '') + (x.keys ? ' (' + x.keys + ' کلید)' : ''));
+    });
+    lines2.push('\nبرای مدیریت: دکمه «کلیدها» یا /keys');
+    return admSend(env, chatId, msgId, lines2.join('\n'), [
+      [{ text: '🔑 مدیریت کلیدها', callback_data: 'adm:keys' }, { text: '🔙 منو', callback_data: 'adm:menu' }]
+    ]);
+  }
 
   if (act === 'debug') {
     await tg(env, 'sendMessage', { chat_id: chatId, text: 'برای عیب‌یابی دستور /debug را بفرست.' });
@@ -14958,12 +15756,19 @@ async function tgAdminCallback(env, ctx, cq) {
     return admShowKeys(env, chatId, msgId);
   }
   if (act === 'addkey') {
-    await admSetState(env, adminUid, { t: 'addkey' });
+    await admSetState(env, adminUid, { t: 'addkey_site' });
     return admSend(env, chatId, msgId,
-      '➕ کلید (یا چند کلید) را بفرست. نوع سرویس از روی پیشوند تشخیص داده می‌شود:\n' +
-      'AIza… Gemini | gsk_… Groq | sk-or-… OpenRouter | apx_live_… Apmix | nvapi-… NVIDIA | csk-… Cerebras | xai-… xAI | sk-… OpenAI | thk_… TokenHarbor | cc_… Clean APIs\n' +
-      'برای Mistral / Z AI / Ollama که پیشوند ندارند، نام سرویس را قبل از کلید بنویس:\nmistral کلید-تو | zai کلید-تو | ollama کلید-تو\n\n' +
-      '🔒 پیام تو بعد از ثبت خودکار پاک می‌شود.\n(لغو: /cancel)', [[{ text: '❌ لغو', callback_data: 'adm:keys' }]]);
+      '➕ افزودن کلید — مرحله ۱ از ۲\n\n' +
+      '🌐 اول آدرس سایت / API را بفرست:\n' +
+      'مثال‌ها:\n' +
+      '• https://openrouter.ai/api/v1\n' +
+      '• https://api.groq.com/openai/v1\n' +
+      '• https://api.example.com/v1\n' +
+      '• api.example.com\n\n' +
+      'اگر سرویس معروف است (Gemini/Groq/OpenRouter) می‌توانی مستقیم کلید را بفرستی.\n\n' +
+      'یا یک‌جا:\nhttps://api.xxx.com/v1 sk-your-key\n\n' +
+      '🔒 پیام بعد از ثبت پاک می‌شود.\nلغو: /cancel',
+      [[{ text: '❌ لغو', callback_data: 'adm:keys' }]]);
   }
 }
 
@@ -14993,36 +15798,119 @@ async function tgAdminHandleState(env, msg, chatId, uid, st) {
     });
     return true;
   }
-  if (st.t === 'addkey') {
-    await admSetState(env, uid, null);
+  if (st.t === 'addkey' || st.t === 'addkey_site' || st.t === 'addkey_key') {
     try { await tg(env, 'deleteMessage', { chat_id: chatId, message_id: msg.message_id }); } catch (e) {}
-    var keys = text.split(/[\s,;]+/).filter(Boolean);
-    var cks = (await env.BOT_KV.get('custom_keys', 'json')) || [];
-    var added = [], skipped = [];
-    var forced = null;   // مثلاً: «mistral KEY»
+
+    // یک‌جا: URL + KEY در یک پیام
+    var oneShotBase = extractApiBaseFromText(text);
+    var oneShotKey = extractApiKeyFromText(text);
+    var hasUrl = !!oneShotBase && !!oneShotBase.base;
+    var hasKey = !!(oneShotKey && oneShotKey.length >= 8);
+    // اگر فقط کلید معروف است (بدون URL)
+    var knownFromKey = false;
+    if (hasKey && !hasUrl) {
+      Object.keys(PROVIDERS).forEach(function (id) {
+        if (PROVIDERS[id].test(oneShotKey)) knownFromKey = true;
+      });
+    }
+
+    if (st.t === 'addkey_key') {
+      // مرحله ۲: منتظر کلید هستیم
+      var keyOnly = extractApiKeyFromText(text);
+      if (!keyOnly || keyOnly.length < 8) {
+        await tg(env, 'sendMessage', {
+          chat_id: chatId,
+          text: '❌ کلید معتبر نیست. کلید API را بفرست (حداقل ۸ کاراکتر).\nلغو: /cancel',
+          reply_markup: { inline_keyboard: [[{ text: '❌ لغو', callback_data: 'adm:keys' }]] }
+        });
+        return true;
+      }
+      await admSetState(env, uid, null);
+      var fin = await finalizeCustomKeyAdd(env, keyOnly, st.site || st.base || '', st.provider || '');
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: fin.ok ? formatKeyAddSuccess(fin) : ('❌ ' + (fin.error || 'ثبت نشد')),
+        reply_markup: { inline_keyboard: [[{ text: '🔑 کلیدها', callback_data: 'adm:keys' }, { text: '➕ یکی دیگر', callback_data: 'adm:addkey' }]] }
+      });
+      return true;
+    }
+
+    // addkey / addkey_site
+    if (hasUrl && hasKey) {
+      await admSetState(env, uid, null);
+      var fin2 = await finalizeCustomKeyAdd(env, oneShotKey, oneShotBase.base, oneShotBase.provider);
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: fin2.ok ? formatKeyAddSuccess(fin2) : ('❌ ' + (fin2.error || 'ثبت نشد')),
+        reply_markup: { inline_keyboard: [[{ text: '🔑 کلیدها', callback_data: 'adm:keys' }, { text: '➕ یکی دیگر', callback_data: 'adm:addkey' }]] }
+      });
+      return true;
+    }
+
+    if (hasKey && knownFromKey) {
+      await admSetState(env, uid, null);
+      var fin3 = await finalizeCustomKeyAdd(env, oneShotKey, '', '');
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: fin3.ok ? formatKeyAddSuccess(fin3) : ('❌ ' + (fin3.error || 'ثبت نشد')),
+        reply_markup: { inline_keyboard: [[{ text: '🔑 کلیدها', callback_data: 'adm:keys' }, { text: '➕ یکی دیگر', callback_data: 'adm:addkey' }]] }
+      });
+      return true;
+    }
+
+    if (hasUrl) {
+      await admSetState(env, uid, {
+        t: 'addkey_key',
+        site: oneShotBase.base,
+        base: oneShotBase.base,
+        provider: oneShotBase.provider || ''
+      });
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: '➕ افزودن کلید — مرحله ۲ از ۲\n\n' +
+          '🌐 سایت: ' + oneShotBase.base + '\n' +
+          '🏷 سرویس: ' + (oneShotBase.provider || 'Custom') + '\n\n' +
+          '🔑 حالا کلید API این سایت را بفرست.\n\nلغو: /cancel',
+        reply_markup: { inline_keyboard: [[{ text: '❌ لغو', callback_data: 'adm:keys' }]] }
+      });
+      return true;
+    }
+
+    // شاید چند کلید با پیشوند / نام provider
+    var tokens = text.split(/[\s,;]+/).filter(Boolean);
+    var forced = null;
     var pairs = [];
-    keys.forEach(function (tok) {
+    tokens.forEach(function (tok) {
       if (PROVIDERS[tok.toLowerCase()]) { forced = tok.toLowerCase(); return; }
       pairs.push({ k: tok, p: forced });
       forced = null;
     });
-    pairs.forEach(function (pr) {
-      var k = pr.k, pid = pr.p;
-      if (!pid) Object.keys(PROVIDERS).forEach(function (id) { if (!pid && PROVIDERS[id].test(k)) pid = id; });
-      if (!pid) { skipped.push(maskKey(k) + ' (نوع نامشخص — بنویس: mistral کلید)'); return; }
-      if (cks.some(function (c) { return c.key === k; })) { skipped.push(maskKey(k) + ' (تکراری)'); return; }
-      cks.push({ provider: pid, key: k, ts: Date.now() });
-      added.push(PROVIDERS[pid].name + ' ' + maskKey(k));
-    });
-    if (added.length) {
-      await env.BOT_KV.put('custom_keys', JSON.stringify(cks));
-      await env.BOT_KV.delete('models_v27'); await env.BOT_KV.delete('cache:wm_v1');
+    if (pairs.length && pairs.every(function (pr) {
+      var pid = pr.p;
+      if (!pid) Object.keys(PROVIDERS).forEach(function (id) { if (!pid && PROVIDERS[id].test(pr.k)) pid = id; });
+      return !!pid;
+    })) {
+      await admSetState(env, uid, null);
+      var linesOut = [];
+      for (var pi = 0; pi < pairs.length; pi++) {
+        var pr = pairs[pi];
+        var pid2 = pr.p;
+        if (!pid2) Object.keys(PROVIDERS).forEach(function (id) { if (!pid2 && PROVIDERS[id].test(pr.k)) pid2 = id; });
+        var finP = await finalizeCustomKeyAdd(env, pr.k, (PROVIDERS[pid2] && PROVIDERS[pid2].base) || '', (PROVIDERS[pid2] && PROVIDERS[pid2].name) || pid2);
+        linesOut.push(finP.ok ? ('✅ ' + finP.provider + ' ' + finP.keyPreview) : ('❌ ' + maskKey(pr.k) + ': ' + (finP.error || '')));
+      }
+      await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: linesOut.join('\n'),
+        reply_markup: { inline_keyboard: [[{ text: '🔑 کلیدها', callback_data: 'adm:keys' }]] }
+      });
+      return true;
     }
+
     await tg(env, 'sendMessage', {
       chat_id: chatId,
-      text: (added.length ? ('✅ اضافه شد:\n' + added.join('\n') + '\n') : '') +
-        (skipped.length ? ('⚠️ رد شد:\n' + skipped.join('\n')) : ''),
-      reply_markup: { inline_keyboard: [[{ text: '🔑 کلیدها', callback_data: 'adm:keys' }]] }
+      text: '🌐 آدرس سایت را نفهمیدم.\n\nمثال:\nhttps://api.example.com/v1\n\nیا یک‌جا:\nhttps://api.example.com/v1 sk-xxxx\n\nلغو: /cancel',
+      reply_markup: { inline_keyboard: [[{ text: '❌ لغو', callback_data: 'adm:keys' }]] }
     });
     return true;
   }
@@ -15071,7 +15959,8 @@ async function tgAdminTryPass(env, msg, chatId, fromId, pass) {
     if (list.indexOf(fromId) === -1) list.push(fromId);
     await env.BOT_KV.put('tg_admins', JSON.stringify(list));
     await tgReply(env, chatId, '✅ تو حالا ادمین هستی. کیبورد به‌روز شد.',
-      { reply_markup: { keyboard: await buildTgKeyboard(env, true), resize_keyboard: true } });
+      { reply_markup: tgKeyboardMarkup(await buildTgKeyboard(env, true)) });
+    queueHideKeyboard(env, chatId, 10);
     await setAdminCommands(env, chatId);
     await admShowMenu(env, chatId, null);
     return;
@@ -15367,14 +16256,49 @@ async function tgWebhook(request, env, ctx) {
     }
 
     // ===== NX: مرورگر صفحه‌بندی‌شده مدل =====
+    if (data.indexOf('mprefresh:') === 0) {
+      try {
+        await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id, text: 'در حال بارگذاری مدل‌ها…' });
+        var refPid = data.slice('mprefresh:'.length);
+        var refRole = await getUserRole(env, cbUid);
+        await refreshProviderModels(env, cbChatId, cbUid, refRole, refPid, cq.message && cq.message.message_id);
+      } catch (eRf) {
+        try { await tgReply(env, cbChatId, 'خطا در بارگذاری: ' + (eRf.message || eRf)); } catch (e2) {}
+      }
+      return new Response('ok');
+    }
+
+    if (data.indexOf('mpprobe:') === 0) {
+      try {
+        await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id, text: 'در حال تست…' });
+        var probePid = data.slice('mpprobe:'.length);
+        var probeRole = await getUserRole(env, cbUid);
+        await runProviderModelProbe(env, cbChatId, cbUid, probeRole, probePid, cq.message && cq.message.message_id);
+      } catch (ePr) {
+        try { await tgReply(env, cbChatId, 'خطا در تست: ' + (ePr.message || ePr)); } catch (e2) {}
+      }
+      return new Response('ok');
+    }
+
     if (data.indexOf('mp:') === 0) {
       try {
         await tg(env, 'answerCallbackQuery', { callback_query_id: cq.id });
-        var mpP = data.split(':');
-        if (mpP[1] === 'noop') return new Response('ok');
+        // فرمت: mp:<pid>:<page>  — pid می‌تواند uk:uk_xxx باشد
+        var mpRest = data.slice(3); // بعد از mp:
+        var mpPage = 0;
+        var mpPid = mpRest;
+        var mpLastColon = mpRest.lastIndexOf(':');
+        if (mpLastColon > 0) {
+          var maybePage = mpRest.slice(mpLastColon + 1);
+          if (/^\d+$/.test(maybePage) || maybePage === 'noop') {
+            mpPage = parseInt(maybePage, 10) || 0;
+            mpPid = mpRest.slice(0, mpLastColon);
+          }
+        }
+        if (mpPid === 'noop') return new Response('ok');
         var mpRole = await getUserRole(env, cbUid);
-        if (mpP[1] === '_') await showProviderMenu(env, cbChatId, cbUid, mpRole, cq.message.message_id);
-        else await showProviderModels(env, cbChatId, cbUid, mpRole, mpP[1], parseInt(mpP[2] || '0', 10), cq.message.message_id);
+        if (mpPid === '_') await showProviderMenu(env, cbChatId, cbUid, mpRole, cq.message.message_id);
+        else await showProviderModels(env, cbChatId, cbUid, mpRole, mpPid, mpPage, cq.message.message_id);
       } catch (e) {}
       return new Response('ok');
     }
@@ -15513,6 +16437,10 @@ async function tgWebhook(request, env, ctx) {
               );
               return;
             }
+            if (customAct === '__hidekb__' || customAct === '/hidekb') {
+              await hideKeyboardNow(env, chatId);
+              return;
+            }
             msg.text = customAct;
           }
         } catch (eAct) {}
@@ -15549,6 +16477,17 @@ async function tgWebhook(request, env, ctx) {
             );
             return;
           }
+          else if (btn === '⬇️ بستن کیبورد' || btn === 'بستن کیبورد' || btn === '/hidekb') {
+            await hideKeyboardNow(env, chatId);
+            return;
+          }
+          else if (btn === 'کیبورد' || btn === '⌨️' || btn === '/keyboard' || btn === 'نوار') {
+            var isAdmKb = await isTgAdmin(env, fromId);
+            await tgReply(env, chatId, '⌨️ کیبورد فعال شد.', {
+              reply_markup: tgKeyboardMarkup(await buildTgKeyboard(env, isAdmKb))
+            });
+            return;
+          }
           else if (btn === '🔑 کلید رایگان' || btn === 'کلید رایگان' || btn === 'دریافت کلید') msg.text = '/freekeys';
           else if (btn === '📥 صندوق') msg.text = '/inbox';
           else if (btn === '🎭 حالت' || btn === 'حالت') msg.text = '/mode';
@@ -15572,6 +16511,90 @@ async function tgWebhook(request, env, ctx) {
         }
       }
       await trackUser(env, uid, name, 'telegram');
+
+      // ویزارد افزودن کلید شخصی (همه کاربران): سایت → کلید
+      if (msg.text) {
+        var uSt = null;
+        try { uSt = await admGetState(env, uid); } catch (eUs) {}
+        if (uSt && (uSt.t === 'uaddkey_site' || uSt.t === 'uaddkey_key')) {
+          var ut = String(msg.text || '').trim();
+          if (ut === '/cancel' || ut === 'لغو') {
+            await admSetState(env, uid, null);
+            await tgReply(env, chatId, '↩️ لغو شد.');
+            return;
+          }
+          if (ut.charAt(0) === '/' && ut.indexOf('/addkey') !== 0) {
+            // دستور دیگر — state را نگه ندار
+            await admSetState(env, uid, null);
+          } else if (uSt.t === 'uaddkey_site') {
+            try { await tg(env, 'deleteMessage', { chat_id: chatId, message_id: msg.message_id }); } catch (eD1) {}
+            var ub = extractApiBaseFromText(ut);
+            var uk = extractApiKeyFromText(ut);
+            if (ub && ub.base && uk && uk.length >= 8) {
+              var modelsX = [];
+              try { modelsX = await discoverUserKeyModels(env, { key: uk, site: ub.base, base: ub.base, name: ub.provider }); } catch (eX) {}
+              await saveUserKey(env, uid, {
+                provider: ub.provider || 'custom', name: ub.provider || 'کلید من',
+                key: uk, base: ub.base, site: ub.base, freeOnly: !!ub.freeOnly,
+                models: modelsX.slice(0, 80)
+              }, name);
+              await admSetState(env, uid, null);
+              await tgReply(env, chatId,
+                '✅ کلید شخصی ذخیره شد\n🏷 ' + (ub.provider || 'Custom') + '\n🌐 ' + ub.base + '\n' +
+                (modelsX.length ? ('🤖 ' + modelsX.length + ' مدل:\n' + modelsX.slice(0, 12).map(function (m, i) { return (i + 1) + '. ' + m; }).join('\n')) : '⚠️ لیست مدل نیامد') +
+                '\n\n🎯 /models'
+              );
+              return;
+            }
+            if (ub && ub.base) {
+              await admSetState(env, uid, { t: 'uaddkey_key', site: ub.base, base: ub.base, provider: ub.provider || '' });
+              await tgReply(env, chatId, '➕ مرحله ۲ از ۲\n🌐 ' + ub.base + '\n\n🔑 کلید API را بفرست.\nلغو: /cancel');
+              return;
+            }
+            // فقط کلید معروف؟
+            var knownK = false;
+            Object.keys(PROVIDERS).forEach(function (id) { if (PROVIDERS[id].test(uk)) knownK = true; });
+            if (uk && uk.length >= 8 && knownK) {
+              var pKnown = 'openai';
+              Object.keys(PROVIDERS).forEach(function (id) { if (PROVIDERS[id].test(uk)) pKnown = id; });
+              var pvK = PROVIDERS[pKnown];
+              await saveUserKey(env, uid, {
+                provider: pKnown, name: (pvK && pvK.name) || pKnown,
+                key: uk, base: (pvK && pvK.base) || '', site: (pvK && pvK.base) || ''
+              }, name);
+              await admSetState(env, uid, null);
+              await tgReply(env, chatId, '✅ کلید «' + ((pvK && pvK.name) || pKnown) + '» ذخیره شد.\n🎯 /models');
+              return;
+            }
+            await tgReply(env, chatId, '🌐 آدرس را نفهمیدم.\nمثال: https://api.example.com/v1\nلغو: /cancel');
+            return;
+          } else if (uSt.t === 'uaddkey_key') {
+            try { await tg(env, 'deleteMessage', { chat_id: chatId, message_id: msg.message_id }); } catch (eD2) {}
+            var uk2 = extractApiKeyFromText(ut);
+            if (!uk2 || uk2.length < 8) {
+              await tgReply(env, chatId, '❌ کلید معتبر نیست. دوباره بفرست یا /cancel');
+              return;
+            }
+            var modelsY = [];
+            try { modelsY = await discoverUserKeyModels(env, { key: uk2, site: uSt.site || uSt.base, base: uSt.base || uSt.site, name: uSt.provider }); } catch (eY) {}
+            await saveUserKey(env, uid, {
+              provider: uSt.provider || 'custom',
+              name: uSt.provider || 'کلید من',
+              key: uk2,
+              base: uSt.base || uSt.site || '',
+              site: uSt.site || uSt.base || '',
+              models: modelsY.slice(0, 80)
+            }, name);
+            await admSetState(env, uid, null);
+            await tgReply(env, chatId,
+              '✅ کلید شخصی ذخیره شد\n🏷 ' + (uSt.provider || 'Custom') + '\n🌐 ' + (uSt.base || uSt.site || '') + '\n' +
+              (modelsY.length ? ('🤖 مدل‌ها:\n' + modelsY.slice(0, 12).map(function (m, i) { return (i + 1) + '. ' + m; }).join('\n')) : '⚠️ لیست مدل نیامد — در چت تست کن') +
+              '\n\n🎯 /models'
+            );
+            return;
+          }
+        }
+      }
 
       // ورودی چندمرحله‌ای ادمین (ارسال همگانی، پیام به کاربر، افزودن کلید)
       if (isAdm && msg.text) {
@@ -15646,13 +16669,9 @@ async function tgWebhook(request, env, ctx) {
               '✉️ پشتیبانی: /support متن پیام\n\n' +
               '🎯 /models · 📊 /status · 📋 /menu');
           await tgReply(env, chatId, startTxt, {
-            reply_markup: {
-              keyboard: await buildTgKeyboard(env, isAdm),
-              resize_keyboard: true,
-              is_persistent: true,
-              input_field_placeholder: 'پیام بنویسید...'
-            }
+            reply_markup: tgKeyboardMarkup(await buildTgKeyboard(env, isAdm))
           });
+          queueHideKeyboard(env, chatId, 10);
           // دوباره منوی دستورات را تنظیم کن (بعد از لاگ‌اوت هم فعال بماند)
           try { await setBotMenu(env); } catch (eM) {}
           return;
@@ -15679,13 +16698,10 @@ async function tgWebhook(request, env, ctx) {
               'اگر هنوز پیام قدیمی دیدی: در تلگرام Clear history را بزن (برای پیام‌هایی که قبل از این نسخه فرستاده شده‌اند).\n' +
               'حافظه شخصی: /forget',
               {
-                reply_markup: {
-                  keyboard: await buildTgKeyboard(env, isAdmR),
-                  resize_keyboard: true,
-                  is_persistent: true
-                }
+                reply_markup: tgKeyboardMarkup(await buildTgKeyboard(env, isAdmR))
               }
             );
+            queueHideKeyboard(env, chatId, 10);
           } catch (eKbR) {}
           return;
         }
@@ -16276,7 +17292,13 @@ async function tgWebhook(request, env, ctx) {
   });
 
   var done = Promise.race([work, watchdog]);
-  ctx.waitUntil(Promise.resolve(work).then(function () { finished = true; }).catch(function () { finished = true; }));
+  // بعد از اتمام پردازش: اگر کیبورد نشان داده شده، بعد از ~۱۰ثانیه جمع شود
+  ctx.waitUntil(
+    Promise.resolve(work)
+      .then(function () { finished = true; })
+      .catch(function () { finished = true; })
+      .then(function () { return flushHideKeyboardJobs(env, null); })
+  );
   await done;
 
   return new Response('ok');
